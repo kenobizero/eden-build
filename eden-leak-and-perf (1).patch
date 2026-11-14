@@ -1,0 +1,379 @@
+diff
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt
+@@ -261,6 +261,12 @@
+ 
+     override fun onDestroy() {
+         mainHandler.removeCallbacks(romSwapStopTimeoutRunnable)
++        // The receiver is only unregistered when PiP exits normally; closing the PiP window
++        // destroys the activity while it is still registered.
++        try {
++            unregisterReceiver(pictureInPictureReceiver)
++        } catch (ignored: Exception) {
++        }
+         super.onDestroy()
+         inputManager.unregisterInputDeviceListener(this)
+         stopForegroundService(this)
+diff
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/applets/keyboard/SoftwareKeyboard.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/applets/keyboard/SoftwareKeyboard.kt
+@@ -49,8 +49,13 @@
+         handler.postDelayed(
+             object : Runnable {
+                 override fun run() {
+-                    val insets = ViewCompat.getRootWindowInsets(overlayView)
+-                    val isKeyboardVisible = insets!!.isVisible(WindowInsets.Type.ime())
++                    // A detached view has no insets; treat that as "keyboard gone" instead of crashing.
++                    val insets = if (overlayView.isAttachedToWindow) {
++                        ViewCompat.getRootWindowInsets(overlayView)
++                    } else {
++                        null
++                    }
++                    val isKeyboardVisible = insets?.isVisible(WindowInsets.Type.ime()) == true
+                     if (isKeyboardVisible) {
+                         handler.postDelayed(this, delayMs.toLong())
+                         return
+diff
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/dialogs/ChatDialog.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/dialogs/ChatDialog.kt
+@@ -92,6 +92,9 @@
+ 
+     override fun dismiss() {
+         NetPlayManager.setChatOpen(false)
++        // The static manager would otherwise keep this dialog and its Activity reachable.
++        NetPlayManager.setOnMessageReceivedListener(null)
++        handler.removeCallbacksAndMessages(null)
+         super.dismiss()
+     }
+ 
+diff
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/dialogs/NetPlayDialog.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/dialogs/NetPlayDialog.kt
+@@ -310,6 +310,11 @@
+         override fun getItemCount() = netPlayItems.size
+     }
+ 
++    override fun dismiss() {
++        NetPlayManager.setOnAdapterRefreshListener(null)
++        super.dismiss()
++    }
++
+     @SuppressLint("NotifyDataSetChanged")
+     fun refreshAdapterItems() {
+         val handler = Handler(Looper.getMainLooper())
+diff
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/fragments/EmulationFragment.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/fragments/EmulationFragment.kt
+@@ -1693,6 +1693,8 @@
+                 }
+                 perfStatsUpdateHandler.postDelayed(perfStatsRunnable!!, 800)
+             }
++            // Drop any pending runnable first so repeated calls do not stack update chains.
++            perfStatsRunnable?.let { perfStatsUpdateHandler.removeCallbacks(it) }
+             perfStatsRunnable = Runnable { perfStatsUpdater?.invoke() }
+             perfStatsUpdateHandler.post(perfStatsRunnable!!)
+         } else {
+@@ -1844,6 +1846,7 @@
+ 
+                 socUpdateHandler.postDelayed(socRunnable!!, 1000)
+             }
++            socRunnable?.let { socUpdateHandler.removeCallbacks(it) }
+             socRunnable = Runnable { socUpdater?.invoke() }
+             socUpdateHandler.post(socRunnable!!)
+         } else {
+diff
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/network/NetPlayManager.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/network/NetPlayManager.kt
+@@ -73,7 +73,7 @@
+     private var messageListener: ((Int, String) -> Unit)? = null
+     private var adapterRefreshListener: ((Int, String) -> Unit)? = null
+ 
+-    fun setOnMessageReceivedListener(listener: (Int, String) -> Unit) {
++    fun setOnMessageReceivedListener(listener: ((Int, String) -> Unit)?) {
+         messageListener = listener
+     }
+ 
+@@ -122,7 +122,7 @@
+         }.start()
+     }
+ 
+-    fun setOnAdapterRefreshListener(listener: (Int, String) -> Unit) {
++    fun setOnAdapterRefreshListener(listener: ((Int, String) -> Unit)?) {
+         adapterRefreshListener = listener
+     }
+ 
+diff
+--- a/src/android/app/src/main/jni/native.cpp
++++ b/src/android/app/src/main/jni/native.cpp
+@@ -366,6 +366,8 @@
+     }
+ 
+     m_is_running = false;
++    // The applet that owns this pointer is destroyed with the system.
++    m_software_keyboard = nullptr;
+ 
+     // Unload user input.
+     m_system.HIDCore().UnloadInputDevices();
+@@ -741,6 +743,22 @@
+     return s_result.c_str();
+ }
+ 
++// This runs once per progress tick inside a single long native call, so every local reference
++// created here has to be released or the local reference table eventually overflows.
++bool InvokeProgressCallback(JNIEnv* env, jobject callback, jmethodID invoke, size_t max,
++                            size_t progress) {
++    jobject j_max = Common::Android::ToJDouble(env, static_cast<double>(max));
++    jobject j_progress = Common::Android::ToJDouble(env, static_cast<double>(progress));
++    jobject j_result = env->CallObjectMethod(callback, invoke, j_max, j_progress);
++    const bool cancelled = j_result != nullptr && Common::Android::GetJBoolean(env, j_result);
++    env->DeleteLocalRef(j_max);
++    env->DeleteLocalRef(j_progress);
++    if (j_result != nullptr) {
++        env->DeleteLocalRef(j_result);
++    }
++    return cancelled;
++}
++
+ } // namespace
+ 
+ extern "C" {
+@@ -754,8 +772,13 @@
+ 
+ void Java_org_yuzu_yuzu_1emu_NativeLibrary_surfaceChanged(JNIEnv* env, jobject instance,
+                                                           [[maybe_unused]] jobject surf) {
++    auto* const previous_window = EmulationSession::GetInstance().NativeWindow();
+     EmulationSession::GetInstance().SetNativeWindow(ANativeWindow_fromSurface(env, surf));
+     EmulationSession::GetInstance().SurfaceChanged();
++    // Drop the reference taken for the previous surface, otherwise it leaks on every resize.
++    if (previous_window) {
++        ANativeWindow_release(previous_window);
++    }
+ }
+ 
+ void Java_org_yuzu_yuzu_1emu_NativeLibrary_surfaceDestroyed(JNIEnv* env, jobject instance) {
+@@ -775,11 +798,9 @@
+     auto jlambdaClass = env->GetObjectClass(jcallback);
+     auto jlambdaInvokeMethod = env->GetMethodID(
+         jlambdaClass, "invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
++    env->DeleteLocalRef(jlambdaClass);
+     const auto callback = [env, jcallback, jlambdaInvokeMethod](size_t max, size_t progress) {
+-        auto jwasCancelled = env->CallObjectMethod(jcallback, jlambdaInvokeMethod,
+-                                                   Common::Android::ToJDouble(env, max),
+-                                                   Common::Android::ToJDouble(env, progress));
+-        return Common::Android::GetJBoolean(env, jwasCancelled);
++        return InvokeProgressCallback(env, jcallback, jlambdaInvokeMethod, max, progress);
+     };
+ 
+     return static_cast<int>(
+@@ -868,8 +889,9 @@
+                                              nullptr, nullptr, file_redirect_dir_, nullptr);
+     auto driver_library = std::make_shared<Common::DynamicLibrary>(handle);
+     InputCommon::InputSubsystem input_subsystem;
+-    auto window =
+-        std::make_unique<EmuWindow_Android>(ANativeWindow_fromSurface(env, j_surf), driver_library);
++    const std::unique_ptr<ANativeWindow, decltype(&ANativeWindow_release)> native_window{
++        ANativeWindow_fromSurface(env, j_surf), &ANativeWindow_release};
++    auto window = std::make_unique<EmuWindow_Android>(native_window.get(), driver_library);
+ 
+     Vulkan::vk::InstanceDispatch dld;
+     Vulkan::vk::Instance vk_instance = Vulkan::CreateInstance(
+@@ -903,8 +925,9 @@
+                                              nullptr, nullptr, file_redirect_dir_, nullptr);
+     auto driver_library = std::make_shared<Common::DynamicLibrary>(handle);
+     InputCommon::InputSubsystem input_subsystem;
+-    auto window =
+-            std::make_unique<EmuWindow_Android>(ANativeWindow_fromSurface(env, j_surf), driver_library);
++    const std::unique_ptr<ANativeWindow, decltype(&ANativeWindow_release)> native_window{
++        ANativeWindow_fromSurface(env, j_surf), &ANativeWindow_release};
++    auto window = std::make_unique<EmuWindow_Android>(native_window.get(), driver_library);
+ 
+     Vulkan::vk::InstanceDispatch dld;
+     Vulkan::vk::Instance vk_instance = Vulkan::CreateInstance(
+@@ -916,8 +939,6 @@
+ 
+     const std::string model_name{device.GetModelName()};
+ 
+-    window.release();
+-
+     return Common::Android::ToJString(env, model_name);
+ #else
+     return Common::Android::ToJString(env, "no-info");
+@@ -1391,12 +1412,16 @@
+ void Java_org_yuzu_yuzu_1emu_NativeLibrary_submitInlineKeyboardText(JNIEnv* env, jclass clazz,
+                                                                     jstring j_text) {
+     const std::u16string input = Common::UTF8ToUTF16(Common::Android::GetJString(env, j_text));
+-    EmulationSession::GetInstance().SoftwareKeyboard()->SubmitInlineKeyboardText(input);
++    if (auto* keyboard = EmulationSession::GetInstance().SoftwareKeyboard()) {
++        keyboard->SubmitInlineKeyboardText(input);
++    }
+ }
+ 
+ void Java_org_yuzu_yuzu_1emu_NativeLibrary_submitInlineKeyboardInput(JNIEnv* env, jclass clazz,
+                                                                      jint j_key_code) {
+-    EmulationSession::GetInstance().SoftwareKeyboard()->SubmitInlineKeyboardInput(j_key_code);
++    if (auto* keyboard = EmulationSession::GetInstance().SoftwareKeyboard()) {
++        keyboard->SubmitInlineKeyboardInput(j_key_code);
++    }
+ }
+ 
+ void Java_org_yuzu_yuzu_1emu_NativeLibrary_initializeEmptyUserDirectory(JNIEnv* env,
+@@ -1631,20 +1656,22 @@
+     auto jlambdaClass = env->GetObjectClass(jcallback);
+     auto jlambdaInvokeMethod = env->GetMethodID(
+         jlambdaClass, "invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
++    env->DeleteLocalRef(jlambdaClass);
+     const auto callback = [env, jcallback, jlambdaInvokeMethod](size_t max, size_t progress) {
+-        auto jwasCancelled = env->CallObjectMethod(jcallback, jlambdaInvokeMethod,
+-                                                   Common::Android::ToJDouble(env, max),
+-                                                   Common::Android::ToJDouble(env, progress));
+-        return Common::Android::GetJBoolean(env, jwasCancelled);
++        return InvokeProgressCallback(env, jcallback, jlambdaInvokeMethod, max, progress);
+     };
+ 
+     auto& session = EmulationSession::GetInstance();
+     std::vector<std::string> result = ContentManager::VerifyInstalledContents(
+         session.System(), *session.GetContentProvider(), callback);
+-    jobjectArray jresult = env->NewObjectArray(result.size(), Common::Android::GetStringClass(),
+-                                               Common::Android::ToJString(env, ""));
++    jstring j_empty = Common::Android::ToJString(env, "");
++    jobjectArray jresult =
++        env->NewObjectArray(result.size(), Common::Android::GetStringClass(), j_empty);
++    env->DeleteLocalRef(j_empty);
+     for (size_t i = 0; i < result.size(); ++i) {
+-        env->SetObjectArrayElement(jresult, i, Common::Android::ToJString(env, result[i]));
++        jstring j_item = Common::Android::ToJString(env, result[i]);
++        env->SetObjectArrayElement(jresult, i, j_item);
++        env->DeleteLocalRef(j_item);
+     }
+     return jresult;
+ }
+@@ -1654,11 +1681,9 @@
+     auto jlambdaClass = env->GetObjectClass(jcallback);
+     auto jlambdaInvokeMethod = env->GetMethodID(
+         jlambdaClass, "invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
++    env->DeleteLocalRef(jlambdaClass);
+     const auto callback = [env, jcallback, jlambdaInvokeMethod](size_t max, size_t progress) {
+-        auto jwasCancelled = env->CallObjectMethod(jcallback, jlambdaInvokeMethod,
+-                                                   Common::Android::ToJDouble(env, max),
+-                                                   Common::Android::ToJDouble(env, progress));
+-        return Common::Android::GetJBoolean(env, jwasCancelled);
++        return InvokeProgressCallback(env, jcallback, jlambdaInvokeMethod, max, progress);
+     };
+     auto& session = EmulationSession::GetInstance();
+     return static_cast<jint>(ContentManager::VerifyGameContents(
+diff
+--- a/src/android/app/src/main/jni/native_input.cpp
++++ b/src/android/app/src/main/jni/native_input.cpp
+@@ -218,9 +218,10 @@
+ 
+ void Java_org_yuzu_yuzu_1emu_features_input_NativeInput_onReadNfcTag(JNIEnv* env, jobject j_obj,
+                                                                      jbyteArray j_data) {
+-    jboolean isCopy{false};
+-    std::span<u8> data(reinterpret_cast<u8*>(env->GetByteArrayElements(j_data, &isCopy)),
+-                       static_cast<size_t>(env->GetArrayLength(j_data)));
++    // Copy out of the Java array so no pinned/copied buffer is left unreleased.
++    std::vector<u8> data(static_cast<size_t>(env->GetArrayLength(j_data)));
++    env->GetByteArrayRegion(j_data, 0, static_cast<jsize>(data.size()),
++                            reinterpret_cast<jbyte*>(data.data()));
+ 
+     if (EmulationSession::GetInstance().IsRunning()) {
+         EmulationSession::GetInstance().GetInputSubsystem().GetVirtualAmiibo()->LoadAmiibo(data);
+@@ -630,6 +631,7 @@
+     for (int i = 0; i < j_connected_array_size; ++i) {
+         ConnectController(i, j_connected_array[i]);
+     }
++    env->ReleaseBooleanArrayElements(j_connected, j_connected_array, JNI_ABORT);
+ }
+ 
+ void Java_org_yuzu_yuzu_1emu_features_input_NativeInput_resetControllerMappings(
+diff
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -714,7 +714,13 @@
+     SwitchableSetting<bool> emulate_bgr565{linkage, false, "emulate_bgr565",
+                                             Category::RendererHacks};
+ 
+-    SwitchableSetting<bool> use_asynchronous_shaders{linkage, false, "use_asynchronous_shaders",
++    SwitchableSetting<bool> use_asynchronous_shaders{linkage,
++#ifdef __ANDROID__
++                                                     true,
++#else
++                                                     false,
++#endif
++                                                     "use_asynchronous_shaders",
+                                                      Category::RendererHacks};
+ 
+     SwitchableSetting<GpuUnswizzleSize> gpu_unswizzle_texture_size{linkage,
+diff
+--- a/src/common/sparse_large_vector.h
++++ b/src/common/sparse_large_vector.h
+@@ -148,6 +148,22 @@
+         }
+     }
+ 
++    /// Gives back the physical memory behind every committed page while keeping the reservation,
++    /// so later accesses still read zeroes instead of faulting.
++    void DecommitAll() noexcept {
++        if (base_ptr == nullptr) {
++            return;
++        }
++        for (std::size_t word = 0; word < committed_pages.size(); ++word) {
++            u64 bits = committed_pages[word].load(std::memory_order_acquire);
++            while (bits != 0) {
++                const std::size_t page_index = word * 64 + static_cast<std::size_t>(std::countr_zero(bits));
++                bits &= bits - 1;
++                DecommitPage(page_index * HostPageSize / sizeof(T));
++            }
++        }
++    }
++
+     constexpr T& GetUnchecked(size_t index) {
+         return base_ptr[index];
+     }
+diff
+--- a/src/core/hle/kernel/k_page_table_base.cpp
++++ b/src/core/hle/kernel/k_page_table_base.cpp
+@@ -502,6 +502,10 @@
+         m_resource_limit->Release(m_system.Kernel(), Svc::LimitableResource::PhysicalMemoryMax,
+                                   m_mapped_ipc_server_memory);
+     }
++
++    // Guest objects are never destroyed (the slab heap only recycles the slot), so the host
++    // pages that back the page table entries would otherwise stay resident after every launch.
++    m_impl.entries.DecommitAll();
+ }
+ 
+ KProcessAddress KPageTableBase::GetRegionAddress(Svc::MemoryState state) const {
+diff
+--- a/src/core/hle/kernel/k_process.cpp
++++ b/src/core/hle/kernel/k_process.cpp
+@@ -180,6 +180,7 @@
+         interface.reset();
+     }
+     m_exclusive_monitor.reset();
++    m_debug_page_refcounts.clear();
+ 
+     // Perform inherited finalization.
+     KSynchronizationObject::Finalize(kernel);
+diff
+--- a/src/video_core/renderer_vulkan/vk_turbo_mode.cpp
++++ b/src/video_core/renderer_vulkan/vk_turbo_mode.cpp
+@@ -8,6 +8,8 @@
+ #include <adrenotools/driver.h>
+ #endif
+ 
++#include <thread>
++
+ #include "common/literals.h"
+ #include "video_core/host_shaders/vulkan_turbo_mode_comp_spv.h"
+ #include "video_core/renderer_vulkan/renderer_vulkan.h"
+@@ -158,6 +160,9 @@
+ #ifdef ARCHITECTURE_arm64
+         adrenotools_set_turbo(true);
+ #endif
++        // Without a pause the wait below returns immediately while the game is submitting work,
++        // which pins a CPU core at 100%.
++        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+ #else
+         // Reset the fence.
+         fence.Reset();
